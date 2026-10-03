@@ -8,6 +8,10 @@
 
 set -eu
 
+# Resolve paths relative to the directory containing this script (normally the ROM root).
+BLUEHEART_ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+export BLUEHEART_ROOT
+
 if command -v python3 >/dev/null 2>&1; then
     PYTHON=python3
 elif command -v python >/dev/null 2>&1 && python -c 'import sys; raise SystemExit(sys.version_info < (3, 8))' 2>/dev/null; then
@@ -36,6 +40,10 @@ Safely applies two source patches used by the BlueHeart01 Android tree:
    before the BPF map is opened in:
        ReadPerProcessGpuMem()
        ReadProcessGpuUsageKb()
+
+3. FrameworkResOverlay_GMS/res/values/config.xml
+   Removes the exact Free Fire Max package allowlist entry:
+       <item>com.dts.freefiremax</item>
 
 Safety features
 ---------------
@@ -74,7 +82,7 @@ from pathlib import Path
 from typing import Optional, Tuple
 
 
-VERSION = "2.0"
+VERSION = "2.1"
 
 AUDIO_COMMENT = "Custom Bluetooth Routes Declaration for Dolby Processing"
 AUDIO_TAGS = ("BT A2DP Out", "BT A2DP Headphones", "BT A2DP Speaker")
@@ -119,6 +127,19 @@ BPF_MAP_CALL = "bpf::BpfMapRO<uint64_t, uint64_t>(kBpfGpuMemTotalMap)"
 BPF_GUARD_RE = re.compile(
     r"if\s*\(\s*access\s*\(\s*kBpfGpuMemTotalMap\s*,\s*F_OK\s*\)\s*!=\s*0\s*\)"
 )
+
+FREEFIRE_ITEM_RE = re.compile(
+    r"^[ \t]*<item>\s*com\.dts\.freefiremax\s*</item>[ \t]*(?:\r?\n|$)",
+    re.MULTILINE,
+)
+
+DEFAULT_ROOT = Path(os.environ.get("BLUEHEART_ROOT", os.getcwd()))
+DEFAULT_AUDIO = str(DEFAULT_ROOT / "device/xiaomi/redwood/audio/audio_policy_configuration.xml")
+DEFAULT_BPF = str(DEFAULT_ROOT / "system/memory/libmeminfo/sysmeminfo.cpp")
+DEFAULT_FRAMEWORK = str(DEFAULT_ROOT / (
+    "vendor/pixel/gms/common/proprietary/product/overlay/"
+    "FrameworkResOverlay_GMS/res/values/config.xml"
+))
 
 FUNCTION_RE_TEMPLATE = r"""
 (?P<header>
@@ -255,6 +276,31 @@ def prepare_audio(path: Path) -> Tuple[bool, str, str]:
     )
 
 
+def prepare_framework(path: Path) -> Tuple[bool, str, str]:
+    """Remove exactly one Free Fire Max allowlist item safely."""
+    if not path.is_file():
+        return False, "", f"{path} not found"
+
+    content = _read_text(path)
+    matches = list(FREEFIRE_ITEM_RE.finditer(content))
+
+    if not matches:
+        return True, content, "already fixed (Free Fire Max allowlist entry absent)"
+
+    if len(matches) != 1:
+        return (
+            False,
+            content,
+            f"ambiguous source: found {len(matches)} Free Fire Max allowlist entries; refusing to patch",
+        )
+
+    patched, count = FREEFIRE_ITEM_RE.subn("", content, count=1)
+    if count != 1 or FREEFIRE_ITEM_RE.search(patched):
+        return False, content, "validation failed: Free Fire Max allowlist entry remains"
+
+    return True, patched, "removed <item>com.dts.freefiremax</item> from the GMS framework overlay"
+
+
 def _find_function_body(content: str, name: str) -> Optional[re.Match[str]]:
     pattern = re.compile(
         FUNCTION_RE_TEMPLATE.format(name=re.escape(name)),
@@ -382,20 +428,26 @@ def prepare_bpf(path: Path) -> Tuple[bool, str, str]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="BlueHeart01 patcher — safe LHDC BT + sysmeminfo BPF source fixes",
+        description="BlueHeart01 patcher — BT audio, sysmeminfo BPF, and Free Fire Max allowlist fixes",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
         "--audio",
-        default="audio_policy_configuration.xml",
+        default=DEFAULT_AUDIO,
         metavar="PATH",
-        help="path to audio_policy_configuration.xml (default: ./audio_policy_configuration.xml)",
+        help="path to audio_policy_configuration.xml (default: device/xiaomi/redwood/audio/audio_policy_configuration.xml)",
     )
     parser.add_argument(
         "--bpf",
-        default="sysmeminfo.cpp",
+        default=DEFAULT_BPF,
         metavar="PATH",
-        help="path to sysmeminfo.cpp (default: ./sysmeminfo.cpp)",
+        help="path to sysmeminfo.cpp (default: system/memory/libmeminfo/sysmeminfo.cpp)",
+    )
+    parser.add_argument(
+        "--framework",
+        default=DEFAULT_FRAMEWORK,
+        metavar="PATH",
+        help="path to FrameworkResOverlay_GMS config.xml (default: vendor/pixel/gms/common/proprietary/product/overlay/FrameworkResOverlay_GMS/res/values/config.xml)",
     )
     parser.add_argument(
         "--no-backup",
@@ -411,12 +463,14 @@ def main() -> int:
 
     audio = Path(args.audio).expanduser()
     bpf = Path(args.bpf).expanduser()
+    framework = Path(args.framework).expanduser()
 
     print("=" * 72)
     print(f" BlueHeart01 Patcher v{VERSION}")
     print("=" * 72)
     print(f" Audio : {audio}")
     print(f" BPF   : {bpf}")
+    print(f" GMS   : {framework}")
     print(f" Mode  : {'VALIDATE ONLY' if args.validate_only else 'PATCH'}")
     print(f" Backup: {'OFF' if args.no_backup else 'ON'}")
     print("-" * 72)
@@ -427,6 +481,7 @@ def main() -> int:
     for path, tag, fn in (
         (audio, "[audio]", prepare_audio),
         (bpf, "[bpf]", prepare_bpf),
+        (framework, "[gms]", prepare_framework),
     ):
         try:
             ok, new_content, message = fn(path)
